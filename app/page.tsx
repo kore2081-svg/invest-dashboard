@@ -1,5 +1,5 @@
 "use client";
-import { useEffect, useState, useCallback } from "react";
+import { useEffect, useState, useCallback, useRef } from "react";
 
 function fmt(n: any, digits = 2): string {
   if (n === null || n === undefined || !isFinite(Number(n))) return "-";
@@ -132,8 +132,8 @@ const ASIA_CARDS = [
   { key: "taiex", title: "대만 가권지수 (TAIEX)" },
 ];
 
-function QuoteCard({ title, d, changeDigits = 3 }: { title: string; d: any; changeDigits?: number }) {
-  if (!d) return <Card title={title}><div className="loading">불러오는 중</div></Card>;
+function QuoteCard({ title, d, changeDigits = 3, pending = false }: { title: string; d: any; changeDigits?: number; pending?: boolean }) {
+  if (!d) return <Card title={title}><div className="loading">{pending ? "불러오는 중" : "시세 조회 실패 · 새로고침해 주세요"}</div></Card>;
   const up = (d.change ?? d.changePct ?? 0) >= 0;
   return (
     <Card title={title} source={`${d.source} · ${d.asOf}`}>
@@ -162,20 +162,40 @@ export default function Dashboard() {
   const [spinning, setSpinning] = useState(false);
   const [err, setErr] = useState<string>("");
 
+  const quoteInFlight = useRef<Promise<void> | null>(null);
+
   const getJSON = useCallback(async (path: string) => {
     const r = await fetch(path, { cache: "no-store" });
     if (!r.ok) throw new Error(`${path}: ${r.status}`);
     return r.json();
   }, []);
 
-  const loadFast = useCallback(async () => {
-    // 하나가 실패해도 나머지는 표시되도록 개별 처리
-    const [q, k] = await Promise.allSettled([getJSON("/api/quotes"), getJSON("/api/kospi")]);
-    if (q.status === "fulfilled") setQuotes(q.value);
-    if (k.status === "fulfilled") setKospi(k.value);
-    const fails = [q, k].filter((r) => r.status === "rejected") as PromiseRejectedResult[];
-    if (fails.length) setErr(`시세 갱신 실패: ${fails.map((f) => f.reason?.message).join(", ")}`);
+  const loadQuotes = useCallback((): Promise<void> => {
+    // 느린 원천 응답 중 15초 타이머/수동 갱신이 겹쳐도 중복 요청하지 않음.
+    if (quoteInFlight.current) return quoteInFlight.current;
+    const request = (async () => {
+      try {
+        const q = await getJSON(`/api/quotes?_t=${Date.now()}`);
+        setQuotes(q);
+        const missing = ["us10y", "brent", "dxy", "usdkrw", "btc"].filter(key => !q[key]);
+        setErr(missing.length ? "일부 시장지표 조회 실패 · 마지막 조회 시각과 각 지표의 기준 시각을 확인하세요." : "");
+      } catch {
+        setQuotes((previous: any) => previous ?? {});
+        setErr("시장지표 갱신 실패 · 표시 중인 값은 이전 조회값입니다. 새로고침해 주세요.");
+      }
+    })();
+    quoteInFlight.current = request;
+    void request.finally(() => { quoteInFlight.current = null; });
+    return request;
   }, [getJSON]);
+
+  const loadKospi = useCallback(async () => {
+    try { setKospi(await getJSON("/api/kospi")); } catch { /* 이전 값 유지 */ }
+  }, [getJSON]);
+
+  const loadFast = useCallback(async () => {
+    await Promise.all([loadQuotes(), loadKospi()]);
+  }, [loadQuotes, loadKospi]);
 
   const loadSlow = useCallback(async () => {
     try {
@@ -202,9 +222,10 @@ export default function Dashboard() {
     refreshAll();
     let lastFast = Date.now();
     let lastSlow = Date.now();
+    let lastKospi = Date.now();
     const runFast = () => {
       lastFast = Date.now();
-      loadFast();
+      loadQuotes();
     };
     const runSlow = () => {
       lastSlow = Date.now();
@@ -213,7 +234,10 @@ export default function Dashboard() {
     const clock = setInterval(() => setNow(new Date()), 1000);
     // 탭이 안 보이면(백그라운드·최소화) API를 부르지 않음 → Vercel 사용량 절약
     const fast = setInterval(() => {
-      if (!document.hidden && Date.now() - lastFast >= 55_000) runFast();
+      if (!document.hidden && Date.now() - lastFast >= 14_000) runFast();
+    }, 15_000);
+    const kospiTimer = setInterval(() => {
+      if (!document.hidden) { lastKospi = Date.now(); loadKospi(); }
     }, 60_000);
     const slow = setInterval(() => {
       if (!document.hidden && Date.now() - lastSlow >= 590_000) runSlow();
@@ -222,7 +246,8 @@ export default function Dashboard() {
     const onVisible = () => {
       if (document.hidden) return;
       const t = Date.now();
-      if (t - lastFast >= 60_000) runFast();
+      if (t - lastFast >= 15_000) runFast();
+      if (t - lastKospi >= 60_000) { lastKospi = t; loadKospi(); }
       if (t - lastSlow >= 600_000) runSlow();
     };
     document.addEventListener("visibilitychange", onVisible);
@@ -230,6 +255,7 @@ export default function Dashboard() {
       clearInterval(clock);
       clearInterval(fast);
       clearInterval(slow);
+      clearInterval(kospiTimer);
       document.removeEventListener("visibilitychange", onVisible);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -240,7 +266,7 @@ export default function Dashboard() {
       <div className="header">
         <div>
           <h1>투자 대시보드</h1>
-          <div className="sub">시장 지표·아시아 지수 60초 자동갱신 · 경제지표/연준발언 10분 자동갱신 · 탭이 안 보이면 일시정지</div>
+          <div className="sub">시장 지표·아시아 지수 15초 자동갱신 · 코스피 60초 갱신 · 경제지표/연준발언 10분 자동갱신 · 탭이 안 보이면 일시정지</div>
         </div>
         <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
           <button className="btn" onClick={refreshAll} disabled={spinning}>
@@ -260,16 +286,20 @@ export default function Dashboard() {
       {err && <div className="err">{err}</div>}
 
       <div className="section-title">시장 지표</div>
+      <div className="note" style={{ marginBottom: 12 }}>
+        마지막 API 조회: {quotes?.updatedAt ? kst(new Date(quotes.updatedAt), { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false }) + " (KST)" : "-"}
+        {" · 새로고침 시 캐시 없이 재조회 · 무료 시세는 지연 가능 · 휴장 중에는 마지막 거래값"}
+      </div>
       <div className="grid5">
         {QUOTE_CARDS.map((c) => (
-          <QuoteCard key={c.key} title={c.title} d={quotes?.[c.key]} />
+          <QuoteCard key={c.key} title={c.title} d={quotes?.[c.key]} pending={!quotes} />
         ))}
         {(() => {
           const d = quotes?.btc;
-          if (!d) return <Card title="비트코인 (BTC)"><div className="loading">불러오는 중</div></Card>;
+          if (!d) return <Card title="비트코인 (BTC)"><div className="loading">{quotes ? "시세 조회 실패 · 새로고침해 주세요" : "불러오는 중"}</div></Card>;
           const up = (d.changePct ?? 0) >= 0;
           return (
-            <Card title="비트코인 (BTC)" source={`${d.source}`}>
+            <Card title="비트코인 (BTC)" source={`${d.source} · 조회 ${d.fetchedAt ? kst(new Date(d.fetchedAt), { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false }) + " (KST)" : "-"}`}>
               <div className="big">
                 ${fmt(d.price, 0)}
               </div>
@@ -285,7 +315,7 @@ export default function Dashboard() {
       <div className="section-title">아시아 증시 · 메모리 가격</div>
       <div className="grid3">
         {ASIA_CARDS.map((c) => (
-          <QuoteCard key={c.key} title={c.title} d={quotes?.[c.key]} changeDigits={2} />
+          <QuoteCard key={c.key} title={c.title} d={quotes?.[c.key]} pending={!quotes} changeDigits={2} />
         ))}
         <Card title="PC용 D램 DDR4 평균가격" source="DRAMeXchange (TrendForce) · 현물/고정거래가격">
           <div className="note" style={{ marginTop: 0, marginBottom: 12 }}>
