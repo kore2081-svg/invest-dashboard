@@ -1,10 +1,8 @@
 import { NextResponse } from "next/server";
-import { getCache, setCache } from "@/app/lib/cache";
 import {
   fetchText,
   fetchJson,
   parseStooqQuote,
-  parseStooqHistory,
   fredSeries,
 } from "@/app/lib/sources";
 
@@ -18,20 +16,6 @@ async function stooqQuotes(): Promise<Record<string, any>> {
     return parseStooqQuote(t);
   } catch {
     return {};
-  }
-}
-
-async function stooqHist(sym: string, days = 45): Promise<number[]> {
-  try {
-    const end = new Date();
-    const start = new Date(Date.now() - days * 864e5);
-    const f = (d: Date) => d.toISOString().slice(0, 10).replace(/-/g, "");
-    const t = await fetchText(
-      `https://stooq.com/q/d/l/?s=${sym}&d1=${f(start)}&d2=${f(end)}&i=d`
-    );
-    return parseStooqHistory(t).map((r) => r.close);
-  } catch {
-    return [];
   }
 }
 
@@ -181,110 +165,76 @@ async function asiaIndex(yahooSym: string, naverSym: string): Promise<any> {
   return null;
 }
 
+// 장중 시세 우선. 무료 제공 데이터는 지연될 수 있어 기준 시각을 함께 표시합니다.
+async function marketQuote(symbol: string, unit: string, label: string): Promise<any> {
+  try {
+    const j = await fetchJson(
+      `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?range=2mo&interval=1d`
+    );
+    const r = j.chart?.result?.[0];
+    const m = r?.meta;
+    if (typeof m?.regularMarketPrice !== "number" || !isFinite(m.regularMarketPrice) ||
+        typeof m.regularMarketTime !== "number" || !isFinite(m.regularMarketTime)) throw new Error("no quote");
+    const value = m.regularMarketPrice;
+    const tz = m.exchangeTimezoneName || "UTC";
+    const day = (sec: number) => new Date(sec * 1000).toLocaleDateString("en-CA", { timeZone: tz });
+    const today = day(m.regularMarketTime);
+    const raw = r.indicators?.quote?.[0]?.close || [];
+    const prior: number[] = (r.timestamp || []).flatMap((t: number, i: number) =>
+      day(t) < today && typeof raw[i] === "number" && isFinite(raw[i]) ? [raw[i]] : []
+    );
+    const prev = Number(m.chartPreviousClose ?? m.previousClose);
+    const previous = prior.length ? prior[prior.length - 1] : (isFinite(prev) && prev > 0 ? prev : null);
+    return {
+      value: +value.toFixed(3),
+      change: previous ? +(value - previous).toFixed(3) : null,
+      changePct: previous ? +(((value - previous) / previous) * 100).toFixed(2) : null,
+      history: [...prior, value].slice(-30),
+      asOf: new Date(m.regularMarketTime * 1000).toLocaleString("ko-KR", { timeZone: "Asia/Seoul" }),
+      source: `Yahoo Finance (${label} · 지연 가능)`,
+      unit,
+    };
+  } catch { return null; }
+}
+
 export async function GET() {
-  const cached = getCache<any>("quotes", 60_000);
-  if (cached) return NextResponse.json(cached);
+  // 시장지표는 인메모리/브라우저/CDN 캐시를 사용하지 않고 매 요청마다 원천 API 재조회.
+  const [live10, liveBrent, liveDxy, btc, krw, nikkei, taiex] = await Promise.all([
+    marketQuote("^TNX", "%", "10년물 금리"),
+    marketQuote("BZ=F", "$", "브렌트유 선물"),
+    marketQuote("DX-Y.NYB", "pt", "DXY"),
+    btcQuote(), usdKrw(),
+    asiaIndex("^N225", ".N225"), asiaIndex("^TWII", ".TWII"),
+  ]);
 
-  const [q, h10y, hDxy, hKrw, brentRows, dgs10Rows, broadRows, btc, krw, nikkei, taiex] =
-    await Promise.all([
-      stooqQuotes(),
-      stooqHist("10usy.b"),
-      stooqHist("dx.f"),
-      stooqHist("usdkrw"),
-      fredRows("DCOILBRENTEU"),
-      fredRows("DGS10"),
-      fredRows("DTWEXBGS"),
-      btcQuote(),
-      usdKrw(),
-      asiaIndex("^N225", ".N225"),
-      asiaIndex("^TWII", ".TWII"),
-    ]);
-
-  const q10 = q["10usy.b"];
-  const qDx = q["dx.f"];
-  const qKrw = q["usdkrw"];
-  const brentLast = brentRows.length ? brentRows[brentRows.length - 1] : null;
-  const dgsLast = dgs10Rows.length ? dgs10Rows[dgs10Rows.length - 1] : null;
-  const broadLast = broadRows.length ? broadRows[broadRows.length - 1] : null;
-
-  const chg = (v: number, p: number) =>
-    p ? +(((v - p) / p) * 100).toFixed(2) : null;
-
-  const data = {
-    us10y: q10
-      ? {
-          value: q10.close,
-          change: +(q10.close - q10.open).toFixed(3),
-          changePct: chg(q10.close, q10.open),
-          history: h10y.slice(-30),
-          asOf: `${q10.date} ${q10.time}`,
-          source: "Stooq (지연 가능)",
-          unit: "%",
-        }
-      : dgsLast
-      ? {
-          value: dgsLast.value,
-          change: null,
-          changePct: null,
-          history: dgs10Rows.slice(-30).map((r) => r.value),
-          asOf: dgsLast.date,
-          source: "FRED DGS10 (전일 종가)",
-          unit: "%",
-        }
-      : null,
-    dxy: qDx
-      ? {
-          value: qDx.close,
-          change: +(qDx.close - qDx.open).toFixed(2),
-          changePct: chg(qDx.close, qDx.open),
-          history: hDxy.slice(-30),
-          asOf: `${qDx.date} ${qDx.time}`,
-          source: "Stooq (지연 가능)",
-          unit: "pt",
-        }
-      : broadLast
-      ? {
-          value: broadLast.value,
-          change: null,
-          changePct: null,
-          history: broadRows.slice(-30).map((r) => r.value),
-          asOf: broadLast.date,
-          source: "FRED 연준 광의 달러지수 (DXY 아님)",
-          unit: "pt",
-        }
-      : null,
-    brent: brentLast
-      ? {
-          value: brentLast.value,
-          change: null,
-          changePct: null,
-          history: brentRows.slice(-30).map((r) => r.value),
-          asOf: brentLast.date,
-          source: "FRED (일일 종가)",
-          unit: "$",
-        }
-      : null,
-    usdkrw: krw
-      ? krw
-      : qKrw
-      ? {
-          value: qKrw.close,
-          change: +(qKrw.close - qKrw.open).toFixed(2),
-          changePct: chg(qKrw.close, qKrw.open),
-          history: hKrw.slice(-30),
-          asOf: `${qKrw.date} ${qKrw.time}`,
-          source: "Stooq (지연 가능)",
-          unit: "원",
-        }
-      : null,
-    btc: btc
-      ? { ...btc, unit: "$" }
-      : null,
-    nikkei,
-    taiex,
-    updatedAt: new Date().toISOString(),
+  // 일별 자료는 장중 조회 실패 시에만 사용하고, 다른 지표를 DXY로 대체하지 않습니다.
+  const [q, brentRows, dgs10Rows] = await Promise.all([
+    (!live10 || !liveDxy || !krw) ? stooqQuotes() : Promise.resolve({} as Record<string, any>),
+    !liveBrent ? fredRows("DCOILBRENTEU") : Promise.resolve([]),
+    !live10 ? fredRows("DGS10") : Promise.resolve([]),
+  ]);
+  const stooq = (quote: any, unit: string) => quote ? {
+    value: quote.close,
+    change: isFinite(quote.open) ? +(quote.close - quote.open).toFixed(3) : null,
+    changePct: quote.open ? +(((quote.close - quote.open) / quote.open) * 100).toFixed(2) : null,
+    history: [], asOf: `${quote.date} ${quote.time}`,
+    source: "Stooq (지연 가능 · 원천 시각)", unit,
+  } : null;
+  const daily = (rows: { date: string; value: number }[], unit: string, source: string) => {
+    const last = rows[rows.length - 1];
+    return last ? { value: last.value, change: null, changePct: null,
+      history: rows.slice(-30).map(r => r.value), asOf: last.date, source, unit } : null;
   };
-
-  setCache("quotes", data);
-  return NextResponse.json(data);
+  const data = {
+    us10y: live10 || stooq(q["10usy.b"], "%") || daily(dgs10Rows, "%", "FRED DGS10 (일별 종가 · 장중 조회 실패)"),
+    brent: liveBrent || daily(brentRows, "$", "FRED 브렌트 현물 (일별 종가 · 선물 조회 실패)"),
+    dxy: liveDxy || stooq(q["dx.f"], "pt"),
+    usdkrw: krw || stooq(q["usdkrw"], "원"),
+    btc: btc ? { ...btc, unit: "$", fetchedAt: new Date().toISOString() } : null,
+    nikkei, taiex, updatedAt: new Date().toISOString(),
+  };
+  return NextResponse.json(data, { headers: {
+    "Cache-Control": "no-store, no-cache, max-age=0, must-revalidate",
+    "CDN-Cache-Control": "no-store", "Vercel-CDN-Cache-Control": "no-store",
+  } });
 }
